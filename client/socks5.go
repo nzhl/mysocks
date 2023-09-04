@@ -1,30 +1,29 @@
-package socks5
+package client
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net"
+
+	"github.com/nzhl/mysocks/logger"
 )
 
-func Process(client net.Conn) ([]byte, error) {
-	if err := Socks5Auth(client); err != nil {
-		fmt.Println("auth error:", err)
-		client.Close()
+func parseAddr(client net.Conn) ([]byte, error) {
+	if err := auth(client); err != nil {
+		logger.Debug("auth error: %s", err.Error())
 		return nil, err
 	}
 
-	addr, err := Socks5Connect(client)
+	addr, err := connect(client)
 	if err != nil {
-		fmt.Println("connect error:", err)
-		client.Close()
+		logger.Debug("connect error: %s", err.Error())
 		return nil, err
 	}
 
 	return addr, nil
 }
 
-func Socks5Auth(client net.Conn) (err error) {
+func auth(client net.Conn) (err error) {
 	buf := make([]byte, 256)
 
 	// VER & NMETHODS
@@ -53,7 +52,7 @@ func Socks5Auth(client net.Conn) (err error) {
 	return nil
 }
 
-func Socks5Connect(client net.Conn) ([]byte, error) {
+func connect(client net.Conn) ([]byte, error) {
 	buf := make([]byte, 256)
 
 	n, err := io.ReadFull(client, buf[:4])

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"io"
+	"net"
 	"os"
 
 	"bytes"
@@ -99,6 +100,10 @@ func numToBytes(n int, order binary.ByteOrder, size int) []byte {
 	}
 
 	return b
+}
+
+func Shadow(conn net.Conn) {
+	// TODO
 }
 
 // aes-128-gcm, tcp

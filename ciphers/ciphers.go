@@ -6,30 +6,142 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
+	"fmt"
 	"io"
-	"net"
-	"os"
-
-	"bytes"
-	"encoding/binary"
 
 	"golang.org/x/crypto/hkdf"
 )
 
-const TAG_LENGTH = 16
-const LEN_LENGTH = 2
+type metaAEADCipher struct {
+	keySize   int
+	saltSize  int
+	nonceSize int
+	tagSize   int
 
+	password string
+}
+
+// 3 AEAD Ciphers
+var config = map[string]metaAEADCipher{
+	"aes-128-gcm": {
+		keySize:   16,
+		saltSize:  16,
+		nonceSize: 12,
+		tagSize:   16,
+	},
+	"aes-192-gcm": {
+		keySize:   24,
+		saltSize:  24,
+		nonceSize: 12,
+		tagSize:   16,
+	},
+	"aes-256-gcm": {
+		keySize:   32,
+		saltSize:  32,
+		nonceSize: 12,
+		tagSize:   16,
+	},
+}
+
+func NewAEADCipher(name, password string) (AEADCipher, error) {
+	cipher, ok := config[name]
+	if !ok {
+		return nil, fmt.Errorf("unsupported cipher: %s", name)
+	}
+	cipher.password = password
+
+	return &cipher, nil
+}
+
+func (c *metaAEADCipher) KeySize() int {
+	return c.keySize
+}
+
+func (c *metaAEADCipher) SaltSize() int {
+	return c.saltSize
+}
+
+func (c *metaAEADCipher) NonceSize() int {
+	return c.nonceSize
+}
+
+func (c *metaAEADCipher) TagSize() int {
+	return c.tagSize
+}
+
+func (c *metaAEADCipher) Encrypter(salt []byte) (cipher.AEAD, error) {
+	masterKey := evpBytesToKey(c.password, c.keySize)
+	subKey, err := hkdfSha1(masterKey, salt, c.keySize)
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := aes.NewCipher(subKey)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	return gcm, nil
+}
+
+func (c *metaAEADCipher) Decrypter(salt []byte) (cipher.AEAD, error) {
+	masterKey := evpBytesToKey(c.password, c.keySize)
+	subKey, err := hkdfSha1(masterKey, salt, c.keySize)
+	if err != nil {
+		return nil, err
+	}
+
+	block, err := aes.NewCipher(subKey)
+	if err != nil {
+		return nil, err
+	}
+
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	return gcm, nil
+}
+
+func (c *metaAEADCipher) GenSalt() ([]byte, error) {
+	salt := make([]byte, c.saltSize)
+
+	_, err := io.ReadFull(rand.Reader, salt)
+	if err != nil {
+		return nil, fmt.Errorf("error while generating salt: %s", err.Error())
+	}
+
+	return salt, nil
+}
+
+func (c *metaAEADCipher) GenNonce() []byte {
+	return make([]byte, c.nonceSize)
+}
+
+// 3.1 EVP_BytesToKey
+// https://www.openssl.org/docs/man1.0.2/man3/EVP_BytesToKey.html
+//
+//	D_i = HASH^count(D_(i-1) || data || salt)
+//
+// case for ss here is count=1, salt=nil
+// code reference:
+// https://github.com/shadowsocks/shadowsocks-go/blob/3e585ff90601765510d31ee1d05b6f63548c7d44/shadowsocks/encrypt.go#L28C2-L28C2
 func md5sum(d []byte) []byte {
 	h := md5.New()
 	h.Write(d)
 	return h.Sum(nil)
 }
 
-func evpBytesToKey(keyLen int) (key []byte) {
-	password := os.Getenv("PROXY_PASSWORD")
+func evpBytesToKey(password string, size int) (key []byte) {
 	const md5Len = 16
 
-	cnt := (keyLen-1)/md5Len + 1
+	cnt := (size-1)/md5Len + 1
 	m := make([]byte, cnt*md5Len)
 	copy(m, md5sum([]byte(password)))
 
@@ -43,177 +155,34 @@ func evpBytesToKey(keyLen int) (key []byte) {
 		copy(d[md5Len:], password)
 		copy(m[start:], md5sum(d))
 	}
-	return m[:keyLen]
+	return m[:size]
 }
 
-func hkdfSha1(masterKey []byte, salt []byte) []byte {
-	// Define your salt and input keying material, ikm
-	// As an example we use simple strings, convert them to byte slices
-	// salt := []byte("your-salt")
-
+// 3.2 HKDF_SHA1
+func hkdfSha1(masterKey []byte, salt []byte, size int) ([]byte, error) {
 	// Create a new HMAC-based Extract-and-Expand Key Derivation Function (HKDF) with SHA-1
 	hkdf := hkdf.New(sha1.New, masterKey, salt, []byte("ss-subkey"))
 
-	// Define the length for the output key
-	length := 16 // e.g., 16 bytes for an AES key.
-
 	// Extract the derived key
-	key := make([]byte, length)
+	key := make([]byte, size)
 	if _, err := io.ReadFull(hkdf, key); err != nil {
-		panic(err)
+		return nil, fmt.Errorf("error while generating subKey: %s", err.Error())
 	}
 
-	return key
+	return key, nil
 }
 
-func genSalt() []byte {
-	salt := make([]byte, 16) // Change the size according to your needs.
+// 3.3 TCP
+// The first AEAD encrypt/decrypt operation uses a counting nonce starting
+// from 0. After each encrypt/decrypt operation, the nonce is incremented
+// by one as if it were an unsigned little-endian integer.
+func incrementNonce(nonce []byte) {
+	for i := range nonce {
+		nonce[i]++
 
-	_, err := io.ReadFull(rand.Reader, salt)
-	if err != nil {
-		panic(err)
-	}
-
-	return salt
-}
-
-func numToBytes(n int, order binary.ByteOrder, size int) []byte {
-	buf := new(bytes.Buffer)
-
-	err := binary.Write(buf, order, uint16(n))
-	if err != nil {
-		panic(err)
-	}
-
-	b := buf.Bytes()
-
-	// If the byte slice is smaller than the requested size, pad with zeros.
-	if len(b) < size {
-		padding := make([]byte, size-len(b))
-		if order == binary.BigEndian {
-			// For big endian, prepend the padding.
-			b = append(padding, b...)
-		} else {
-			// For little endian, append the padding.
-			b = append(b, padding...)
+		// not carry
+		if nonce[i] != 0 {
+			break
 		}
-	}
-
-	return b
-}
-
-func Shadow(conn net.Conn) {
-	// TODO
-}
-
-// aes-128-gcm, tcp
-func Encode(source io.Reader, destination io.Writer, addr []byte) error {
-	key := evpBytesToKey(16)
-	salt := genSalt()
-	subKey := hkdfSha1(key, salt)
-
-	// Create a new cipher block from the key.
-	block, err := aes.NewCipher(subKey)
-	if err != nil {
-		return err
-	}
-
-	// Create a new GCM. Note that the key must be 16 bytes for AES-128.
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-
-	nonce := 0
-	payload := make([]byte, 1024*10)
-
-	// salt first
-	destination.Write(salt)
-	for {
-		actualLen, err := source.Read(payload)
-		if actualLen == 0 && err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			println("error while read from socks5: ", err.Error())
-			return err
-		}
-
-		if nonce == 0 {
-			payload = append(addr, payload...)
-			actualLen += len(addr)
-		}
-
-		cipherTextWithTag := gcm.Seal([]byte{}, numToBytes(nonce+1, binary.LittleEndian, gcm.NonceSize()), payload[:actualLen], nil)
-		cipherLengthWithTag := gcm.Seal([]byte{}, numToBytes(nonce, binary.LittleEndian, gcm.NonceSize()), numToBytes(len(cipherTextWithTag)-TAG_LENGTH, binary.BigEndian, LEN_LENGTH), nil)
-
-		// write to destination
-		_, err = destination.Write(append(cipherLengthWithTag, cipherTextWithTag...))
-		if err != nil {
-			println("error while write to ssserver: ", err)
-			return err
-		}
-		nonce += 2
-	}
-}
-
-func Decode(source io.Reader, destination io.Writer) error {
-	key := evpBytesToKey(16)
-	salt := make([]byte, 16)
-	actualLen, err := io.ReadFull(source, salt)
-	if actualLen != 16 {
-		return err
-	}
-	subKey := hkdfSha1(key, salt)
-
-	// Create a new cipher block from the key.
-	block, err := aes.NewCipher(subKey)
-	if err != nil {
-		return err
-	}
-
-	// Create a new GCM. Note that the key must be 16 bytes for AES-128.
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-
-	nonce := 0
-	for {
-		cipherLengthWithTag := make([]byte, LEN_LENGTH+TAG_LENGTH)
-		actualLen, err := io.ReadFull(source, cipherLengthWithTag)
-		if actualLen == 0 && err == io.EOF {
-			return nil
-		}
-		if actualLen != LEN_LENGTH+TAG_LENGTH {
-			println("error while read payload length: ", err.Error())
-			return err
-		}
-
-		lenBytes, err := gcm.Open(cipherLengthWithTag[:0], numToBytes(nonce, binary.LittleEndian, gcm.NonceSize()), cipherLengthWithTag, nil)
-		if err != nil {
-			println("decrypt length err: ", err.Error())
-			return err
-		}
-		encryptedPayloadLen := int(binary.BigEndian.Uint16(lenBytes))
-
-		encryptedPayloadWithTag := make([]byte, encryptedPayloadLen+TAG_LENGTH)
-		actualLen, err = io.ReadFull(source, encryptedPayloadWithTag)
-		if actualLen != encryptedPayloadLen+TAG_LENGTH {
-			println("error while read payload: ", err.Error())
-			return err
-		}
-
-		payload, err := gcm.Open(encryptedPayloadWithTag[:0], numToBytes(nonce+1, binary.LittleEndian, gcm.NonceSize()), encryptedPayloadWithTag, nil)
-		if err != nil {
-			println("decrypt payload error: ", err)
-			return err
-		}
-		_, err = destination.Write(payload)
-		if err != nil {
-			println("error while write to socks5 ", err)
-			return err
-		}
-		nonce += 2
 	}
 }

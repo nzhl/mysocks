@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
 
-	_ "github.com/joho/godotenv/autoload"
 	"github.com/nzhl/mysocks/ciphers"
 	"github.com/nzhl/mysocks/logger"
 )
@@ -21,6 +19,7 @@ type Config struct {
 
 type Client struct {
 	config Config
+	cipher ciphers.AEADCipher
 }
 
 func New() *Client {
@@ -31,6 +30,7 @@ func New() *Client {
 	flag.StringVar(&client.config.port, "port", "8888", "port number you are listen to")
 	flag.StringVar(&client.config.cipher, "cipher", "aes-128-gcm", "cipher method i.e. aes-128-gcm")
 	flag.Parse()
+	logger.Debug("Parsed Config: %+v \n", client.config)
 
 	if client.config.server == "" {
 		fmt.Println("server-url is required")
@@ -42,7 +42,12 @@ func New() *Client {
 		os.Exit(1)
 	}
 
-	logger.Debug("Config: %+v \n", client.config)
+	cipher, err := ciphers.NewAEADCipher(client.config.cipher, client.config.password)
+	if err != nil {
+		fmt.Println("cipher is not supported ", err.Error())
+		os.Exit(1)
+	}
+	client.cipher = cipher
 
 	return client
 }
@@ -95,31 +100,11 @@ func (c *Client) handle(socks5Conn net.Conn) {
 	}
 	defer ssConn.Close()
 
-	var wg sync.WaitGroup
+	shadowedConn := ciphers.NewShadowConn(ssConn, c.cipher)
 
-	// forward info between
-	// socks5Conn <=> ssConn
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		err := ciphers.Encode(socks5Conn, ssConn, targetAddr)
-		if err != nil {
-			logger.Debug("Error encoding message: %s", err.Error())
-			return
-		}
-		ssConn.CloseWrite()
-	}()
+	// 1.1 Addressing, Addresses used in Shadowsocks follow the socks5 address format
+	// 1.2 TCP, [target address][payload]
+	shadowedConn.Write(targetAddr)
 
-	go func() {
-		defer wg.Done()
-		err = ciphers.Decode(ssConn, socks5Conn)
-		if err != nil {
-			logger.Debug("Error decoding message: %s", err.Error())
-			return
-		}
-		ssConn.CloseRead()
-	}()
-
-	wg.Wait()
-
+	// TOOD: relay between socsk5 and shadow connnection
 }

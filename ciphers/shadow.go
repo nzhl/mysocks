@@ -43,6 +43,7 @@ var maxPayloadLength = 16*1024 - 1
 var payloadLengthSize = 2
 
 func (c *ShadowConn) Read(b []byte) (total int, err error) {
+	logger.Debug("trying to read %d bytes from shadow connection", len(b))
 	if c.decrypter == nil {
 		salt := make([]byte, c.cipher.SaltSize())
 		n, err := io.ReadFull(c.Conn, salt)
@@ -63,59 +64,51 @@ func (c *ShadowConn) Read(b []byte) (total int, err error) {
 		n := copy(b, c.readBuf)
 		c.readBuf = c.readBuf[n:]
 
-		if n == len(b) {
-			return n, nil
-		}
-		b = b[n:]
+		return n, nil
 	}
 
 	payload := make([]byte, payloadLengthSize+2*c.cipher.TagSize()+maxPayloadLength)
-	for cursor := 0; cursor < len(b); {
-		n, err := io.ReadFull(c.Conn, payload[:payloadLengthSize+c.cipher.TagSize()])
-		if n == 0 && err == io.EOF {
-			return total, nil
-		}
-		if err != nil {
-			logger.Debug("error while read payload length: %s", err.Error())
-			return total, err
-		}
-
-		lenBytes, err := c.decrypter.Open(payload[:payloadLengthSize], c.nonceForDecrypter, payload[:payloadLengthSize+c.cipher.TagSize()], nil)
-		if err != nil {
-			logger.Debug("decrypt length err: %s", err.Error())
-			return total, err
-		}
-		incrementNonce(c.nonceForDecrypter)
-
-		payloadLength := int(binary.BigEndian.Uint16(lenBytes))
-		_, err = io.ReadFull(c.Conn, payload[:payloadLength+c.cipher.TagSize()])
-		if err != nil {
-			logger.Debug("error while read payload: %s", err.Error())
-			return total, err
-		}
-
-		dst := b[cursor:]
-		if payloadLength > len(b)-cursor {
-			c.readBuf = make([]byte, payloadLength)
-			dst = c.readBuf
-		}
-		_, err = c.decrypter.Open(dst, c.nonceForDecrypter, payload[:payloadLength+c.cipher.TagSize()], nil)
-		if err != nil {
-			println("decrypt payload error: ", err)
-			return total, err
-		}
-		incrementNonce(c.nonceForDecrypter)
-		total += payloadLength
-
-		if payloadLength > len(b)-cursor {
-			n = copy(b[cursor:], dst)
-			c.readBuf = c.readBuf[n:]
-			break
-		} else {
-			cursor += payloadLength
-		}
+	_, err = io.ReadFull(c.Conn, payload[:payloadLengthSize+c.cipher.TagSize()])
+	if err != nil {
+		return total, err
 	}
 
+	lenBytes, err := c.decrypter.Open(payload[:0], c.nonceForDecrypter, payload[:payloadLengthSize+c.cipher.TagSize()], nil)
+	if err != nil {
+		logger.Debug("decrypt length err: %s", err.Error())
+		return total, err
+	}
+	incrementNonce(c.nonceForDecrypter)
+
+	payloadLength := int(binary.BigEndian.Uint16(lenBytes))
+	logger.Debug("decrypt length: %d", payloadLength)
+	_, err = io.ReadFull(c.Conn, payload[:payloadLength+c.cipher.TagSize()])
+	if err != nil {
+		logger.Debug("error while read payload: %s", err.Error())
+		return total, err
+	}
+
+	dst := b
+	if payloadLength > len(b) {
+		c.readBuf = make([]byte, payloadLength)
+		dst = c.readBuf
+	}
+	_, err = c.decrypter.Open(dst[:0], c.nonceForDecrypter, payload[:payloadLength+c.cipher.TagSize()], nil)
+	if err != nil {
+		println("decrypt payload error: ", err)
+		return total, err
+	}
+	incrementNonce(c.nonceForDecrypter)
+
+	if payloadLength > len(b) {
+		n := copy(b, dst)
+		c.readBuf = c.readBuf[n:]
+		total += n
+	} else {
+		total += payloadLength
+	}
+
+	logger.Debug("read %d bytes from shadow connection", total)
 	return total, nil
 }
 
@@ -126,6 +119,7 @@ func (c *ShadowConn) Read(b []byte) (total int, err error) {
 // [encrypted payload length][length tag][encrypted payload][payload tag]
 
 func (c *ShadowConn) Write(b []byte) (total int, err error) {
+	logger.Debug("trying to write %d bytes to shadow connection", len(b))
 	if c.encrypter == nil {
 		salt, nil := c.cipher.GenSalt()
 		if err != nil {
@@ -156,12 +150,13 @@ func (c *ShadowConn) Write(b []byte) (total int, err error) {
 			payloadLength = len(b[cursor:])
 		}
 
-		payload[0], payload[1] = byte(payloadLength>>8), byte(payloadLength)
 		// big-endian payload size
-		c.encrypter.Seal(payload, c.nonceForEncrypter, payload[:payloadLengthSize], nil)
+		payload[0], payload[1] = byte(payloadLength>>8), byte(payloadLength)
+
+		c.encrypter.Seal(payload[:0], c.nonceForEncrypter, payload[:payloadLengthSize], nil)
 		incrementNonce(c.nonceForEncrypter)
 
-		c.encrypter.Seal(payload[payloadLengthSize+c.cipher.TagSize():], c.nonceForEncrypter, b[cursor:cursor+payloadLength], nil)
+		c.encrypter.Seal(payload[:payloadLengthSize+c.cipher.TagSize()], c.nonceForEncrypter, b[cursor:cursor+payloadLength], nil)
 		incrementNonce(c.nonceForEncrypter)
 
 		n, err := c.Conn.Write(payload[:payloadLengthSize+2*c.cipher.TagSize()+payloadLength])
